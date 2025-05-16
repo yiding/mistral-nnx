@@ -1,0 +1,29 @@
+[project]
+name = "mistral_nnx"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "flax>=0.10.5",
+    "jax>=0.5.3",
+    "jaxtyping>=0.3.2",
+    "safetensors>=0.5.3",
+    "transformers",
+]
+
+[dependency-groups]
+dev = [
+    "mistral-inference>=1.6.0",
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.5",
+    "standard-imghdr>=3.13.0",
+    "tensorboard-plugin-profile>=2.19.4",
+    "tensorboard>=2.19.0",
+    "tensorflow>=2.19.0",
+    "torch>=2.6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
