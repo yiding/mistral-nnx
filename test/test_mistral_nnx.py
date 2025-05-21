@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import mistral_nnx
-from mistral_nnx import sampler
+from mistral_nnx import generate
 
 import collections
 import jax
@@ -28,13 +28,13 @@ class TestSample(TestCase):
     def test__sample_top_p(self):
         probs = jnp.array([[0, 0.3, 0.6], [0.6, 0.2, 0]], dtype=DTYPE)
         key = jax.random.key(0)
-        indexes = sampler._sample_top_p(probs, 0.5, key)
+        indexes = generate._sample_top_p(probs, 0.5, key)
         expected = jnp.array([2, 0], dtype="int32")
         self.assertAllEqual(expected, indexes)
 
     def test_sample_best(self):
         probs = jnp.array([[0, 0.3, 0.6], [0.6, 0.2, 0]], dtype=DTYPE)
-        indexes = sampler.sample_best(probs)
+        indexes = generate.sample_best(probs)
         expected = jnp.array([2, 0], dtype="int32")
         self.assertAllEqual(expected, indexes)
 
@@ -45,7 +45,7 @@ class TestSample(TestCase):
             key = jax.random.key(seed)
             # Use a small top_p to ensure only the most likely gets selected.
             expected = jnp.array([3, 0], dtype="int32")
-            actual = sampler.sample_top_p(probs, temperature=1.0, top_p=0.2, key=key)
+            actual = generate.sample_top_p(probs, temperature=1.0, top_p=0.2, key=key)
             self.assertAllEqual(
                 expected,
                 actual,
@@ -58,7 +58,7 @@ class TestSample(TestCase):
         for seed in range(0, 1000):
             key = jax.random.key(seed)
             # Use a small top_p to ensure only the most likely gets selected.
-            chosen = sampler.sample_top_p(probs, temperature=0.7, top_p=0.5, key=key)
+            chosen = generate.sample_top_p(probs, temperature=0.7, top_p=0.5, key=key)
             counts[chosen.item()] += 1
         self.assertGreater(
             counts[0], counts[1], "most likely option is chosen more frequently"
@@ -146,7 +146,7 @@ class TestGenerate(TestCase):
             param_dtype="float32",
             rngs=rngs,
         )
-        generator = mistral_nnx.Generator(model, max_tokens=256)
+        generator = generate.Generator(model, max_tokens=256)
         r = generator.generate([1, 2, 3, 4, 5], rngs=nnx.Rngs(0), max_tokens=15)
         self.assertTrue(len(r) > 5)
 

@@ -1,1 +1,1 @@
-from .mistral_nnx import *
+from .model import *

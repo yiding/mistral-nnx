@@ -45,7 +45,7 @@ def get_nnx_result():
         )
     
     with timer("NNX model loading"):
-        nnx_model = mistral_nnx.load_model(
+        nnx_model = mistral_nnx.MistralModel.load(
             MODEL, WEIGHTS, dtype=jnp.float32, sharding_rules=SHARDING_RULES)
 
     @jax.jit
