@@ -637,7 +637,7 @@ def save_model(model, path):
 def load_model(
     model_name,
     param_file,
-    dtype="float16",
+    dtype="float32",
     param_dtype="bfloat16",
     sharding_rules: Sequence[tuple[str, str]] | None = None,
 ):
@@ -697,7 +697,7 @@ def load_model(
     return nnx.merge(graphdef, non_params, param)
 
 
-def load_from_hf_pt_model(model_name, dtype="float16", param_dtype="bfloat16"):
+def load_from_hf_pt_model(model_name, dtype="float32", param_dtype="bfloat16"):
     """Load model from HF pytorch model.
 
     Renames, transposes, and reshapes tensors as necessary.
@@ -797,3 +797,14 @@ def load_from_hf_pt_model(model_name, dtype="float16", param_dtype="bfloat16"):
         return model
 
     return init_params(state)
+
+
+def convert_and_save_if_not_exist(
+    weights_path: str,
+    model_name: str,
+    param_dtype: Dtype,
+):
+    if os.path.exists(weights_path):
+        return
+    model = load_from_hf_pt_model(model_name, param_dtype=param_dtype)
+    save_model(model, weights_path)
