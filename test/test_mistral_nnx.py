@@ -140,7 +140,7 @@ class TestGenerate(TestCase):
             head_dim=16,
         )
         rngs = nnx.Rngs(params=0)
-        model = mistral_nnx.MistralModule(
+        model = mistral_nnx.MistralModel(
             config,
             dtype="float32",
             param_dtype="float32",

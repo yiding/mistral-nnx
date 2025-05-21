@@ -431,7 +431,7 @@ class TransformerBlock(nnx.Module):
         return h + r, cache
 
 
-class MistralModule(nnx.Module):
+class MistralModel(nnx.Module):
     layers: list[TransformerBlock]
     config: MistralConfig
 
@@ -652,7 +652,7 @@ def load_model(
     config = MistralConfig.from_pretrained(model_name)
     assert isinstance(config, MistralConfig)
     abs_model = nnx.eval_shape(
-        lambda: MistralModule(
+        lambda: MistralModel(
             config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -667,7 +667,7 @@ def load_model(
     # This gets things like precomputed rope-embedding constants.
     @jax.jit
     def non_param():
-        model = MistralModule(
+        model = MistralModel(
             config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0)
         )
         return nnx.state(model, nnx.Not(nnx.OfType(nnx.Param)))
@@ -710,14 +710,14 @@ def load_from_hf_pt_model(
         model_name: HF model repo or path to a local checkout.
 
     Returns:
-        MistralModule with loaded weights.
+        MistralModel with loaded weights.
     """
     HF_MODEL_SHARD_INDEX = "model.safetensors.index.json"
 
     config = MistralConfig.from_pretrained(model_name)
     assert isinstance(config, MistralConfig)
     abs_model = nnx.eval_shape(
-        lambda: MistralModule(
+        lambda: MistralModel(
             config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0)
         )
     )
@@ -796,7 +796,7 @@ def load_from_hf_pt_model(
     # https://flax.readthedocs.io/en/latest/guides/surgery.html#memory-efficient-partial-initialization
     @nnx.jit(donate_argnums=0)
     def init_params(loaded_state):
-        model = MistralModule(
+        model = MistralModel(
             config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0)
         )
         nnx.update(model, loaded_state)
