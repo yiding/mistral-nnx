@@ -195,12 +195,7 @@ def _init_with_sharding(
 class FeedForward(nnx.Module):
 
     def __init__(
-        self,
-        dim: int,
-        hidden_dim: int,
-        dtype: Any,
-        param_dtype: jnp.dtype,
-        rngs: nnx.Rngs,
+        self, dim: int, hidden_dim: int, dtype: Any, param_dtype: Dtype, rngs: nnx.Rngs
     ):
         self.dim = dim
         self.hidden_dim = hidden_dim
@@ -377,7 +372,7 @@ class TransformerBlock(nnx.Module):
         norm_eps: float,
         rope: RotaryEmbedding,
         dtype: Any,
-        param_dtype: jnp.dtype,
+        param_dtype: Dtype,
         rngs: nnx.Rngs,
         sharding_rules: Sequence[tuple[str, str]] | None = None,
     ):
@@ -546,11 +541,17 @@ class MistralModule(nnx.Module):
 
 
 class Generator:
+    """Token generator using the mistral model.
+
+    - Holds on to a jitted function for running the model.
+    - Instantiates and uses KV cache to do incremental decoding.
+    """
     def __init__(self, model, max_tokens):
         self.model = model
         self.max_tokens = max_tokens
 
-        # Use jax.jit with pre-split model to avoid nnx.jit overhead.
+        # Use jax.jit with pre-split model to avoid nnx.jit's cpu and memory
+        # overhead.
         self.graphdef, self.state = nnx.split(self.model)
         self._jit_decode = jax.jit(
             self._jit_decode_impl,
@@ -595,6 +596,7 @@ class Generator:
         # prefill cache and get first token
         input = jnp.array(input_ids, dtype="int32")
         input = input.reshape(1, -1)
+        logits = None
         for i in range(input.shape[1]):
             logits, cache = self._jit_decode(
                 self.graphdef,
@@ -602,6 +604,7 @@ class Generator:
                 input[1, i].reshape(1, 1),
                 cache,
             )
+        assert logits is not None
 
         for _ in range(max_tokens):
             last_chosen = self._jit_sample_top_p(
@@ -647,6 +650,7 @@ def load_model(
         sharding_rules: if set, load the weights with the correct sharding.
     """
     config = MistralConfig.from_pretrained(model_name)
+    assert isinstance(config, MistralConfig)
     abs_model = nnx.eval_shape(
         lambda: MistralModule(
             config,
@@ -680,9 +684,7 @@ def load_model(
 
         def load_one(path, abs_param: ShapeDtypeStruct):
             k = jax.tree_util.keystr(path[:-1], simple=True, separator="/")
-            param = jnp.array(
-                f.get_tensor(k), dtype=abs_param.dtype
-            )
+            param = jnp.array(f.get_tensor(k), dtype=abs_param.dtype)
             assert (
                 param.shape == abs_param.shape
             ), f"Wrong shape for {jax.tree_util.keystr(path)}. Expected: {abs_param.shape}, actual: {param.shape}"
@@ -697,7 +699,9 @@ def load_model(
     return nnx.merge(graphdef, non_params, param)
 
 
-def load_from_hf_pt_model(model_name, dtype="float32", param_dtype="bfloat16"):
+def load_from_hf_pt_model(
+    model_name, dtype: Dtype = jnp.float32, param_dtype: Dtype = jnp.bfloat16
+):
     """Load model from HF pytorch model.
 
     Renames, transposes, and reshapes tensors as necessary.
@@ -711,6 +715,7 @@ def load_from_hf_pt_model(model_name, dtype="float32", param_dtype="bfloat16"):
     HF_MODEL_SHARD_INDEX = "model.safetensors.index.json"
 
     config = MistralConfig.from_pretrained(model_name)
+    assert isinstance(config, MistralConfig)
     abs_model = nnx.eval_shape(
         lambda: MistralModule(
             config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0)
@@ -720,6 +725,7 @@ def load_from_hf_pt_model(model_name, dtype="float32", param_dtype="bfloat16"):
 
     index = cached_file(model_name, HF_MODEL_SHARD_INDEX)
     shard_paths, meta = get_checkpoint_shard_files(model_name, index)
+    assert isinstance(shard_paths, list)
 
     with ExitStack() as stack:
         shards = {

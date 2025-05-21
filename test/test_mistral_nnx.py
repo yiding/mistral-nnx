@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-import collections
 import mistral_nnx
 from mistral_nnx import sampler
 
+import collections
 import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
-
-
-import jax
-import jax.numpy as jnp
-import flax.nnx as nnx
-
 import unittest
 
 # on cuda using float16/float32 results in weird precision errors causing test
