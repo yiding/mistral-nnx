@@ -2,10 +2,10 @@
 name = "mistral_nnx"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "flax>=0.10.5",
-    "jax>=0.5.3",
+    "jax>=0.5.0",
     "jaxtyping>=0.3.2",
     "safetensors>=0.5.3",
     "transformers",
@@ -22,6 +22,7 @@ dev = [
     "tensorflow>=2.19.0",
     "torch>=2.6.0",
     "pyright>=1.1.400",
+    "pytest>=8.3.5",
 ]
 
 [build-system]

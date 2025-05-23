@@ -10,7 +10,8 @@ import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
 
-MESH = jax.make_mesh((4,), axis_names=('x',))
+DEVICES = jax.devices('cpu')
+MESH = jax.make_mesh((len(DEVICES),), axis_names=('x',))
 SHARDING_RULES = list({
     mistral_nnx.Axis.EMBED: None,
     mistral_nnx.Axis.MLP: "x",
@@ -22,7 +23,7 @@ SHARDING_RULES = list({
 
 
 MODEL = "mistralai/Mistral-Small-24B-Instruct-2501"
-WEIGHTS = "./Mistral-Small-24B-Instruct-2501.bfloat16.nnx"
+WEIGHTS = "./Mistral-Small-24B-Instruct-2501.bfloat16.nnx.safetensors"
 INPUT = (
     "[INST]What is the name of the largest planet in our solar system?[/INST] Jupiter"
 )
@@ -63,20 +64,21 @@ def get_nnx_result():
         result_nnx = compiled_model(graphdef, state, tokens["input_ids"])
     return result_nnx
 
+def test_compare_hf():
+    # Run HF model inference.
+    with MESH:
+        nnx_result = get_nnx_result()
+    hf_result = get_hf_result()
 
-with MESH:
-    nnx_result = get_nnx_result()
-hf_result = get_hf_result()
+    # Check that the results are close enough.
+    diff = hf_result - nnx_result
+    abs_max_diff = jnp.abs(diff).max()
+    print(f"max(|diff|) = {abs_max_diff}")
+    assert abs_max_diff < 1e-4, f"expected max(|diff|) < 1e-4"
 
-# Check that the results are close enough.
-diff = hf_result - nnx_result
-abs_max_diff = jnp.abs(diff).max()
-print(f"max(|diff|) = {abs_max_diff}")
-assert abs_max_diff < 1e-4, f"expected max(|diff|) < 1e-4"
-
-# Check argmax are the same
-hf_argmax = jnp.argmax(hf_result, axis=-1)
-nnx_argmax = jnp.argmax(nnx_result, axis=-1)
-print(f"hf_argmax  = {hf_argmax}")
-print(f"nnx_argmax = {nnx_argmax}")
-assert jnp.all(hf_argmax == nnx_argmax), "expected argmax to match."
+    # Check argmax are the same
+    hf_argmax = jnp.argmax(hf_result, axis=-1)
+    nnx_argmax = jnp.argmax(nnx_result, axis=-1)
+    print(f"hf_argmax  = {hf_argmax}")
+    print(f"nnx_argmax = {nnx_argmax}")
+    assert hf_argmax.tolist() == nnx_argmax.tolist(), "expected argmax to match."

@@ -24,7 +24,7 @@ Not supported:
 """
 
 from contextlib import ExitStack
-from enum import StrEnum
+from enum import Enum
 from flax import nnx
 from flax.typing import Dtype, Initializer
 from jax import Array, ShapeDtypeStruct
@@ -33,7 +33,7 @@ from safetensors import safe_open
 from transformers import MistralConfig
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 import flax.core.spmd
 import flax.struct
 import jax
@@ -43,17 +43,19 @@ import safetensors
 import safetensors.flax
 
 from .embedding import apply_rotary_embedding, generate_fixed_pos_embedding
+from .util import keystr_simple
 
 
-class Axis(StrEnum):
-    """Logical axis names for sharding."""
-
+class Axis(str, Enum):
     EMBED = "embed"
     MLP = "mlp"
     HEAD = "head"
     QHEAD = "qhead"
     KVHEAD = "kvhead"
     VOCAB = "vocab"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @flax.struct.dataclass
@@ -543,7 +545,7 @@ class MistralModel(nnx.Module):
         state = nnx.state(self, nnx.OfType(nnx.Param))
         tensors = {}
         for k, v in nnx.to_flat_state(state):
-            tensors[jax.tree_util.keystr(k, simple=True, separator="/")] = v.value
+            tensors[keystr_simple(k, separator="/")] = v.value
         safetensors.flax.save_file(tensors, path)
 
     @classmethod
@@ -597,11 +599,11 @@ class MistralModel(nnx.Module):
         with safe_open(param_path, framework="np") as f:
 
             def load_one(path, abs_param: ShapeDtypeStruct):
-                k = jax.tree_util.keystr(path[:-1], simple=True, separator="/")
+                k = keystr_simple(path[:-1], separator="/")
                 param = jnp.array(f.get_tensor(k), dtype=abs_param.dtype)
                 assert (
                     param.shape == abs_param.shape
-                ), f"Wrong shape for {jax.tree_util.keystr(path)}. Expected: {abs_param.shape}, actual: {param.shape}"
+                ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
                 return param
 
             param = jax.tree_util.tree_map_with_path(load_one, abs_state)
@@ -695,19 +697,17 @@ class MistralModel(nnx.Module):
                 if path[0].key == "layers":
                     idx = path[1].key
                     layer_name, postprocess = layer_name_map[
-                        jax.tree_util.keystr(path[2:], simple=True, separator="/")
+                        keystr_simple(path[2:], separator="/")
                     ]
                     name = f"model.layers.{idx}.{layer_name}"
                 else:
-                    name, postprocess = name_map[
-                        jax.tree_util.keystr(path, simple=True, separator="/")
-                    ]
+                    name, postprocess = name_map[keystr_simple(path, separator="/")]
 
                 param = shards[meta["weight_map"][name]].get_tensor(name)
                 param = postprocess(param, abs_param)
                 assert (
                     param.shape == abs_param.shape
-                ), f"Wrong shape for {jax.tree_util.keystr(path)}. Expected: {abs_param.shape}, actual: {param.shape}"
+                ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
                 return param.astype(abs_param.dtype)
 
             state = jax.tree_util.tree_map_with_path(load_one, abs_state)
