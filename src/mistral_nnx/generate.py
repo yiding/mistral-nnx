@@ -3,6 +3,8 @@ import jax
 from jaxtyping import Float, Integer
 from jax import Array
 import jax.numpy as jnp
+from dataclasses import dataclass
+from .model import MistralModel
 
 
 def sample_best(logits: Float[Array, "*B V"]) -> Integer[Array, "*B"]:
@@ -43,6 +45,14 @@ def _sample_top_p(
     return next_token
 
 
+@dataclass
+class GenerateResult:
+    tokens: list[int]
+
+    # all logits, including those from input tokens
+    logits: Float[Array, "S V"]
+
+
 class Generator:
     """Token generator using the mistral model.
 
@@ -50,9 +60,18 @@ class Generator:
     - Instantiates and uses KV cache to do incremental decoding.
     """
 
-    def __init__(self, model, max_tokens):
+    def __init__(self, model: MistralModel, max_seqlen: int):
+        """
+        Args:
+            model: Mistral model.
+            max_seqlen: Maximum sequence length (input + max_tokens). This
+                controls the size of the allocated KV cache.
+
+        Note: max_seqlen is fixed at startup to prevent excessive jitting with
+        different kv cache sizes.
+        """
         self.model = model
-        self.max_tokens = max_tokens
+        self.max_seqlen = max_seqlen
 
         # Use jax.jit with pre-split model to avoid nnx.jit's cpu and memory
         # overhead.
@@ -80,7 +99,7 @@ class Generator:
         temperature: float = 1.0,
         top_p: float = 0.8,
         eos_id: int | None = 2,
-    ):
+    ) -> GenerateResult:
         """Generate output with simple greedy search.
 
         Args:
@@ -92,10 +111,11 @@ class Generator:
 
         """
         max_tokens = max(len(input_ids), max_tokens)
-        assert max_tokens < self.max_tokens
+        assert max_tokens < self.max_seqlen
         result = list(input_ids)
 
-        cache = self.model.create_cache(1, self.max_tokens)
+        cache = self.model.create_cache(1, self.max_seqlen)
+        all_logits: list[Float[Array, "1 1 V"]] = []
 
         # prefill cache and get first token
         input = jnp.array(input_ids, dtype="int32")
@@ -108,6 +128,7 @@ class Generator:
                 input[1, i].reshape(1, 1),
                 cache,
             )
+            all_logits.append(logits)
         assert logits is not None
 
         for _ in range(max_tokens):
@@ -128,5 +149,9 @@ class Generator:
                 last_chosen.reshape(1, 1),
                 cache,
             )
+            all_logits.append(logits)
 
-        return result
+        return GenerateResult(
+            tokens=result,
+            logits=jnp.stack([x.reshape(-1) for x in all_logits]),
+        )

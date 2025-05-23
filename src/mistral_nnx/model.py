@@ -25,6 +25,7 @@ Not supported:
 
 from contextlib import ExitStack
 from enum import Enum
+import functools
 from flax import nnx
 from flax.typing import Dtype, Initializer
 from jax import Array, ShapeDtypeStruct
@@ -309,7 +310,7 @@ class Attention(nnx.Module):
         )
 
     @property
-    def _queries_per_head(self):
+    def _queries_per_head(self) -> int:
         return self.n_q_heads // self.n_kv_heads
 
     def __call__(self, x: Array) -> Array:
@@ -375,7 +376,6 @@ class TransformerBlock(nnx.Module):
         dtype: Any,
         param_dtype: Dtype,
         rngs: nnx.Rngs,
-        sharding_rules: Sequence[tuple[str, str]] | None = None,
     ):
         init = _init_with_sharding(nnx.initializers.ones_init())
 
@@ -450,8 +450,12 @@ class MistralModel(nnx.Module):
 
         self.config = config
         self.dtype = dtype
+
+        head_dim = config.head_dim
+        assert type(head_dim) is int
+
         rope = RotaryEmbedding(
-            features=config.head_dim,
+            features=head_dim,
             length=config.max_position_embeddings,
             theta=config.rope_theta,
         )
@@ -486,7 +490,7 @@ class MistralModel(nnx.Module):
                 hidden_dim=config.intermediate_size,
                 n_q_heads=config.num_attention_heads,
                 n_kv_heads=config.num_key_value_heads,
-                head_dim=config.head_dim,
+                head_dim=head_dim,
                 norm_eps=config.rms_norm_eps,
                 rope=rope,
                 param_dtype=param_dtype,
@@ -531,12 +535,14 @@ class MistralModel(nnx.Module):
         return logits, cache
 
     def create_cache(self, batch_size: int, max_seqlen: int) -> KVCache:
+        head_dim = self.config.head_dim
+        assert type(head_dim) is int
         return KVCache.create(
             len(self.layers),
             batch_size=batch_size,
             max_seqlen=max_seqlen,
             num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.head_dim,
+            head_dim=head_dim,
             dtype=self.dtype,
         )
 
@@ -547,6 +553,51 @@ class MistralModel(nnx.Module):
         for k, v in nnx.to_flat_state(state):
             tensors[keystr_simple(k, separator="/")] = v.value
         safetensors.flax.save_file(tensors, path)
+
+    @classmethod
+    def _load_with(
+        cls,
+        loader: Callable[[nnx.State], nnx.State],
+        model_name: str,
+        dtype: Dtype,
+        param_dtype: Dtype,
+        sharding_rules: Sequence[tuple[str, str]] | None = None,
+    ):
+        """Create a model instance using the specific weight loading function.
+
+        Args:
+            loader: weight loading function that takes abstract Param state and
+                returns loaded Params.
+        """
+        config = MistralConfig.from_pretrained(model_name)
+        assert isinstance(config, MistralConfig)
+        abs_model = nnx.eval_shape(
+            lambda: cls(
+                config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=nnx.Rngs(0),
+            )
+        )
+        graphdef = nnx.graphdef(abs_model)
+        abs_params = nnx.state(abs_model, nnx.OfType(nnx.Param))
+
+        # Initialize non-param states from an actual new instance.
+        # The non-returned arrays should be eliminated by jit.
+        # This gets things like precomputed rope-embedding constants.
+        @jax.jit
+        def non_param():
+            model = cls(config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0))
+            return nnx.state(model, nnx.Not(nnx.OfType(nnx.Param)))
+
+        non_params = jax.block_until_ready(non_param())
+        params = loader(abs_params)
+
+        if sharding_rules:
+            with flax.core.spmd.logical_axis_rules(sharding_rules):
+                pspecs = nnx.get_partition_spec(abs_params)
+            params = jax.lax.with_sharding_constraint(params, pspecs)
+        return nnx.merge(graphdef, non_params, params)
 
     @classmethod
     def load(
@@ -568,51 +619,13 @@ class MistralModel(nnx.Module):
                 If set, load the weights with the correct sharding, otherwise,
                 weights are loaded as unsharded single device (jax default).
         """
-        config = MistralConfig.from_pretrained(model_name)
-        assert isinstance(config, MistralConfig)
-        abs_model = nnx.eval_shape(
-            lambda: cls(
-                config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=nnx.Rngs(0),
-            )
+        return cls._load_with(
+            functools.partial(_load_saved_params, param_path),
+            model_name,
+            dtype,
+            param_dtype,
+            sharding_rules,
         )
-        graphdef = nnx.graphdef(abs_model)
-        abs_state = nnx.state(abs_model, nnx.OfType(nnx.Param))
-
-        # Initialize non-param states from an actual new instance.
-        # The non-returned arrays should be eliminated by jit.
-        # This gets things like precomputed rope-embedding constants.
-        @jax.jit
-        def non_param():
-            model = cls(config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0))
-            return nnx.state(model, nnx.Not(nnx.OfType(nnx.Param)))
-
-        non_params = jax.block_until_ready(non_param())
-
-        # Load the params from file.
-        #
-        # safetensor loads to numpy natively, then call conversion functions to put
-        # it into the correct framework's array type. Doing the jax array
-        # conversion ourselves lets us pass additional parameters.
-        with safe_open(param_path, framework="np") as f:
-
-            def load_one(path, abs_param: ShapeDtypeStruct):
-                k = keystr_simple(path[:-1], separator="/")
-                param = jnp.array(f.get_tensor(k), dtype=abs_param.dtype)
-                assert (
-                    param.shape == abs_param.shape
-                ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
-                return param
-
-            param = jax.tree_util.tree_map_with_path(load_one, abs_state)
-
-        if sharding_rules:
-            with flax.core.spmd.logical_axis_rules(sharding_rules):
-                pspecs = nnx.get_partition_spec(abs_state)
-            param = jax.lax.with_sharding_constraint(param, pspecs)
-        return nnx.merge(graphdef, non_params, param)
 
     @classmethod
     def load_from_hf_pt_model(
@@ -620,109 +633,140 @@ class MistralModel(nnx.Module):
         model_name: str,
         dtype: Dtype = jnp.float32,
         param_dtype: Dtype = jnp.bfloat16,
+        sharding_rules: Sequence[tuple[str, str]] | None = None,
+        mesh: jax.sharding.Mesh | None = None,
     ) -> "MistralModel":
         """Load model from HF pytorch model.
 
         Renames, transposes, and reshapes tensors as necessary.
 
         Args:
-            model_name: HF model repo or path to a local checkout.
+            model_name: HF model name
+            dtype: computation dtype
+            param_dtype: dtype of the parameters
+            sharding_rules:
+                If set, load the weights with the correct sharding, otherwise,
+                weights are loaded as unsharded single device (jax default).
 
         Returns:
             MistralModel with loaded weights.
         """
-        HF_MODEL_SHARD_INDEX = "model.safetensors.index.json"
-
-        config = MistralConfig.from_pretrained(model_name)
-        assert isinstance(config, MistralConfig)
-        abs_model = nnx.eval_shape(
-            lambda: MistralModel(
-                config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0)
-            )
+        return cls._load_with(
+            functools.partial(_load_hf_pt_params, model_name),
+            model_name,
+            dtype,
+            param_dtype,
+            sharding_rules,
         )
-        abs_state = nnx.state(abs_model, nnx.OfType(nnx.Param))
 
-        index = cached_file(model_name, HF_MODEL_SHARD_INDEX)
-        shard_paths, meta = get_checkpoint_shard_files(model_name, index)
-        assert isinstance(shard_paths, list)
 
-        with ExitStack() as stack:
-            shards = {
-                os.path.basename(s): stack.enter_context(safe_open(s, "flax"))
-                for s in shard_paths
+def _load_saved_params(path: str, abs_state: nnx.State) -> nnx.State:
+    """Load model from safetensors file.
+
+    Args:
+       path: path to safetensors file.
+        abs_state: abstract state of nnx.Params of the model.
+
+    Returns:
+        nnx.State with actual param arrays that can be `nnx.merge`d into the
+        model.
+    """
+    with safe_open(path, framework="np") as f:
+
+        def load_one(path, abs_param: ShapeDtypeStruct):
+            k = keystr_simple(path[:-1], separator="/")
+            param = jnp.array(f.get_tensor(k), dtype=abs_param.dtype)
+            assert (
+                param.shape == abs_param.shape
+            ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
+            return param
+
+        return jax.tree_util.tree_map_with_path(load_one, abs_state)
+
+
+def _load_hf_pt_params(hf_model: str, abs_state: nnx.State) -> nnx.State:
+    """Load model from HF pytorch model.
+
+    Renames, transposes, and reshapes tensors as necessary.
+
+    Args:
+        hf_model: HF model name or path.
+        abs_state: abstract state of nnx.Params of the model.
+
+    Returns:
+        nnx.State with actual param arrays that can be `nnx.merge`d into the
+        model.
+    """
+    HF_MODEL_SHARD_INDEX = "model.safetensors.index.json"
+    index = cached_file(hf_model, HF_MODEL_SHARD_INDEX)
+    shard_paths, meta = get_checkpoint_shard_files(hf_model, index)
+    assert isinstance(shard_paths, list)
+
+    with ExitStack() as stack:
+        shards = {
+            os.path.basename(s): stack.enter_context(safe_open(s, "flax"))
+            for s in shard_paths
+        }
+
+        def transpose_only(param: jax.Array, _abs_param):
+            return param.transpose()
+
+        def transpose_reshape(param: jax.Array, abs_param):
+            return param.transpose().reshape(abs_param.shape)
+
+        def identity(param: jax.Array, _abs_param):
+            return param
+
+        def load_one(path, abs_param):
+            # Map to hf pt model (name, need_transpose)
+            name_map = {
+                "embed/embedding/value": ("model.embed_tokens.weight", identity),
+                "output/kernel/value": ("lm_head.weight", transpose_only),
+                "norm/scale/value": ("model.norm.weight", identity),
             }
+            layer_name_map = {
+                "attention/wq/kernel/value": (
+                    "self_attn.q_proj.weight",
+                    transpose_reshape,
+                ),
+                "attention/wk/kernel/value": (
+                    "self_attn.k_proj.weight",
+                    transpose_reshape,
+                ),
+                "attention/wv/kernel/value": (
+                    "self_attn.v_proj.weight",
+                    transpose_reshape,
+                ),
+                "attention/wo/kernel/value": (
+                    "self_attn.o_proj.weight",
+                    transpose_reshape,
+                ),
+                "attention_norm/scale/value": ("input_layernorm.weight", identity),
+                "mlp/w1/kernel/value": ("mlp.gate_proj.weight", transpose_only),
+                "mlp/w2/kernel/value": ("mlp.down_proj.weight", transpose_only),
+                "mlp/w3/kernel/value": ("mlp.up_proj.weight", transpose_only),
+                "ffn_norm/scale/value": (
+                    "post_attention_layernorm.weight",
+                    identity,
+                ),
+            }
+            if path[0].key == "layers":
+                idx = path[1].key
+                layer_name, postprocess = layer_name_map[
+                    keystr_simple(path[2:], separator="/")
+                ]
+                name = f"model.layers.{idx}.{layer_name}"
+            else:
+                name, postprocess = name_map[keystr_simple(path, separator="/")]
 
-            def transpose_only(param: jax.Array, _abs_param):
-                return param.transpose()
+            param = shards[meta["weight_map"][name]].get_tensor(name)
+            param = postprocess(param, abs_param)
+            assert (
+                param.shape == abs_param.shape
+            ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
+            return param.astype(abs_param.dtype)
 
-            def transpose_reshape(param: jax.Array, abs_param):
-                return param.transpose().reshape(abs_param.shape)
-
-            def identity(param: jax.Array, _abs_param):
-                return param
-
-            def load_one(path, abs_param):
-                # Map to hf pt model (name, need_transpose)
-                name_map = {
-                    "embed/embedding/value": ("model.embed_tokens.weight", identity),
-                    "output/kernel/value": ("lm_head.weight", transpose_only),
-                    "norm/scale/value": ("model.norm.weight", identity),
-                }
-                layer_name_map = {
-                    "attention/wq/kernel/value": (
-                        "self_attn.q_proj.weight",
-                        transpose_reshape,
-                    ),
-                    "attention/wk/kernel/value": (
-                        "self_attn.k_proj.weight",
-                        transpose_reshape,
-                    ),
-                    "attention/wv/kernel/value": (
-                        "self_attn.v_proj.weight",
-                        transpose_reshape,
-                    ),
-                    "attention/wo/kernel/value": (
-                        "self_attn.o_proj.weight",
-                        transpose_reshape,
-                    ),
-                    "attention_norm/scale/value": ("input_layernorm.weight", identity),
-                    "mlp/w1/kernel/value": ("mlp.gate_proj.weight", transpose_only),
-                    "mlp/w2/kernel/value": ("mlp.down_proj.weight", transpose_only),
-                    "mlp/w3/kernel/value": ("mlp.up_proj.weight", transpose_only),
-                    "ffn_norm/scale/value": (
-                        "post_attention_layernorm.weight",
-                        identity,
-                    ),
-                }
-                if path[0].key == "layers":
-                    idx = path[1].key
-                    layer_name, postprocess = layer_name_map[
-                        keystr_simple(path[2:], separator="/")
-                    ]
-                    name = f"model.layers.{idx}.{layer_name}"
-                else:
-                    name, postprocess = name_map[keystr_simple(path, separator="/")]
-
-                param = shards[meta["weight_map"][name]].get_tensor(name)
-                param = postprocess(param, abs_param)
-                assert (
-                    param.shape == abs_param.shape
-                ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
-                return param.astype(abs_param.dtype)
-
-            state = jax.tree_util.tree_map_with_path(load_one, abs_state)
-
-        # Use jit to initialize just the param arrays without default-initializing them.
-        # https://flax.readthedocs.io/en/latest/guides/surgery.html#memory-efficient-partial-initialization
-        @nnx.jit(donate_argnums=0)
-        def init_params(loaded_state):
-            model = MistralModel(
-                config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0)
-            )
-            nnx.update(model, loaded_state)
-            return model
-
-        return init_params(state)
+        return jax.tree_util.tree_map_with_path(load_one, abs_state)
 
 
 def convert_and_save_if_not_exist(
