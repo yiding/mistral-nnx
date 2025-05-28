@@ -1,6 +1,7 @@
 import time
 from contextlib import contextmanager
 from typing import Generator
+from jax import ShapeDtypeStruct
 from jax.tree_util import KeyPath, SequenceKey, DictKey, GetAttrKey, FlattenedIndexKey
 
 
@@ -40,4 +41,17 @@ def keystr_simple(keypath: KeyPath, separator: str = "") -> str:
 
     return separator.join(
         simple(k) for k in keypath
+    )
+
+
+def update_sharding(abs_array: ShapeDtypeStruct, sharding)->ShapeDtypeStruct:
+    """Update sharding on a ShapeDtypeStruct.
+
+    Equivalent to `a.update(sharding=sharding)` on newer Jax versions.
+    """
+    return ShapeDtypeStruct(
+        shape=abs_array.shape,
+        dtype=abs_array.dtype,
+        sharding=sharding,
+        weak_type=abs_array.weak_type,
     )

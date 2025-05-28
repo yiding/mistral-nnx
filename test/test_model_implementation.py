@@ -49,47 +49,55 @@ def mesh():
 
 
 @pytest.fixture(scope="module")
-def hf_model() -> transformers.AutoModelForCausalLM:
+def nnx_model(mesh: jax.sharding.Mesh) -> nnx.Module:
+    with timer("NNX model weight conversion"):
+        if not NNX_MODEL.exists():
+            mistral_nnx.convert_hf_model(MODEL, NNX_MODEL)
+
+    with timer("NNX model loading"):
+        return mistral_nnx.MistralModel.load(
+            NNX_MODEL, dtype=jnp.float32, mesh=mesh, sharding_rules=SHARDING_RULES,
+        )
+
+
+def load_hf_model() -> transformers.MistralForCausalLM:
     with timer("HF model loading"):
         return transformers.AutoModelForCausalLM.from_pretrained(MODEL)
 
 
-@pytest.fixture(scope="module")
-def nnx_model(mesh: jax.sharding.Mesh) -> nnx.Module:
-    with timer("NNX model weight conversion"):
-        mistral_nnx.convert_and_save_if_not_exist(
-            NNX_MODEL, MODEL, param_dtype=jnp.bfloat16
-        )
+def test_compare_hf(tokenizer, mesh, nnx_model):
+    """Compare model implementation output vs huggingface torch model.
 
-    with timer("NNX model loading"):
-        return mistral_nnx.MistralModel.load_multi(
-            MODEL, NNX_MODEL, dtype=jnp.float32, sharding_rules=SHARDING_RULES,
-        )
-
-
-def test_compare_hf(tokenizer, mesh, nnx_model, hf_model):
-    """Compare model implementation output vs huggingface torch model."""
+    HF model is loaded and discarded to reduce memory usage.
+    """
     input = "[INST]What is the name of the largest planet in our solar system?[/INST] Jupiter"
 
-    # Run HF model inference.
-    @jax.jit
-    def jit_model(graphdef, state, input):
-        model = nnx.merge(graphdef, state)
-        return model(input)
+    def get_nnx_result():
+        @jax.jit
+        def jit_model(graphdef, state, input):
+            model = nnx.merge(graphdef, state)
+            return model(input)
 
-    graphdef, state = nnx.split(nnx_model)
-    tokens = tokenizer(input, return_tensors="jax")["input_ids"]
+        graphdef, state = nnx.split(nnx_model)
+        tokens = tokenizer(input, return_tensors="jax")["input_ids"]
 
-    with timer("test_compare_hf - jit compile"):
-        compiled_model = jit_model.lower(graphdef, state, tokens).compile()
+        with timer("test_compare_hf - jit compile"):
+            compiled_model = jit_model.lower(graphdef, state, tokens).compile()
 
-    with timer("test_compare_hf - nnx forward pass"):
-        nnx_result = compiled_model(graphdef, state, tokens)
-        nnx_result.block_until_ready()
+        with timer("test_compare_hf - nnx forward pass"):
+            nnx_result = compiled_model(graphdef, state, tokens)
+            nnx_result.block_until_ready()
+            return nnx_result
 
-    tokens = tokenizer(input, return_tensors="pt")
-    with timer("test_compare_hf - hf forward pass"):
-        hf_result = jnp.array(hf_model.forward(**tokens).logits.detach())
+    nnx_result = get_nnx_result()
+
+    def get_hf_result():
+        tokens = tokenizer(input, return_tensors="pt")
+        with timer("test_compare_hf - hf forward pass"):
+            logits = load_hf_model().forward(**tokens).logits
+            assert logits is not None
+            return jnp.array(logits.detach())
+    hf_result = get_hf_result()
 
     # Check that the results are close enough.
     diff = hf_result - nnx_result

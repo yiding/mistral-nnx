@@ -26,7 +26,6 @@ Not supported:
 from contextlib import ExitStack
 from enum import Enum
 import functools
-import json
 from pathlib import Path
 from flax import nnx
 from flax.typing import Dtype, Initializer
@@ -42,19 +41,14 @@ import flax.struct
 import jax
 import jax.numpy as jnp
 import os
-import safetensors
-import safetensors.flax
+import orbax.checkpoint as ocp
 
 from .embedding import apply_rotary_embedding, generate_fixed_pos_embedding
-from .util import keystr_simple
+from .util import keystr_simple, update_sharding
 
 
 PARAM_INDEX_FILE = "model.safetensors.index.json"
 SINGLE_PARAM_FILE = "model.safetensors"
-
-
-def _multi_param_file(fileno: int) -> Path:
-    return Path(f"model-{fileno}.safetensors")
 
 
 class Axis(str, Enum):
@@ -556,52 +550,21 @@ class MistralModel(nnx.Module):
             dtype=self.dtype,
         )
 
-    def save(self, model_dir: Path):
-        """Save model parameters into a safetensor file."""
-        model_dir.mkdir(exist_ok=True)
+    def save_orbax(self, ckpt_dir: Path, max_file_size: int = 1 * 1024 * 1024 * 1024):
+        """Save model parameters with orbax."""
         state = nnx.state(self, nnx.OfType(nnx.Param))
-        tensors = {}
-        for k, v in nnx.to_flat_state(state):
-            tensors[keystr_simple(k, separator="/")] = v.value
-        safetensors.flax.save_file(tensors, model_dir / SINGLE_PARAM_FILE)
-
-    def save_multi(self, model_dir: Path, max_file_size: int = 1 * 1024 * 1024 * 1024):
-        """Save model parameters into multiple safetensor files.
-        """
-        model_dir.mkdir(exist_ok=True)
-        state = nnx.state(self, nnx.OfType(nnx.Param))
-        index = {}
-        cur_tensors = {}
-        cur_sz = 0
-        file_count = 1
-        for k, v in nnx.to_flat_state(state):
-            key = keystr_simple(k, separator="/")
-            array = v.value
-            assert isinstance(array, Array)
-            cur_tensors[key] = array
-            cur_sz += array.nbytes
-            if cur_sz > max_file_size:
-                file = _multi_param_file(file_count)
-                safetensors.flax.save_file(cur_tensors, model_dir / file)
-                index.update({tk: str(file) for tk in cur_tensors})
-                cur_tensors = {}
-                cur_sz = 0
-                file_count += 1
-
-        file = _multi_param_file(file_count)
-        safetensors.flax.save_file(cur_tensors, model_dir / file)
-        index.update({tk: str(file) for tk in cur_tensors})
-
-        with open(model_dir / PARAM_INDEX_FILE, "w") as f:
-            json.dump({"metadata": {}, "weight_map": index}, f)
+        checkpointer = ocp.StandardCheckpointer()
+        checkpointer.save(ckpt_dir.absolute(), state)
+        checkpointer.wait_until_finished()
 
     @classmethod
     def _load_with(
         cls,
         loader: Callable[[nnx.State], nnx.State],
-        model_name: str,
+        config: MistralConfig,
         dtype: Dtype,
         param_dtype: Dtype,
+        mesh: jax.sharding.Mesh | None = None,
         sharding_rules: Sequence[tuple[str, str]] | None = None,
     ):
         """Create a model instance using the specific weight loading function.
@@ -609,9 +572,9 @@ class MistralModel(nnx.Module):
         Args:
             loader: weight loading function that takes abstract Param state and
                 returns loaded Params.
+            mesh: if specified with sharding rules, load to assigned devices.
+                Otherwise, load to `SingleDeviceSharding(jax.devices("cpu")[0])`.
         """
-        config = MistralConfig.from_pretrained(model_name)
-        assert isinstance(config, MistralConfig)
         abs_model = nnx.eval_shape(
             lambda: cls(
                 config,
@@ -622,6 +585,24 @@ class MistralModel(nnx.Module):
         )
         graphdef = nnx.graphdef(abs_model)
         abs_params = nnx.state(abs_model, nnx.OfType(nnx.Param))
+
+        # annotate abstract params with sharding
+        if sharding_rules is not None and mesh is not None:
+            # this is a bit awkward, can probably be done within eval_shape.
+            with flax.core.spmd.logical_axis_rules(sharding_rules):
+                pspecs = nnx.get_partition_spec(abs_params)
+
+            def add_sharding(param: ShapeDtypeStruct, p):
+                return update_sharding(param, jax.sharding.NamedSharding(mesh, p))
+
+            abs_params = jax.tree.map(add_sharding, abs_params, pspecs)
+        elif sharding_rules is None and mesh is None:
+            single = jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])
+            abs_params = jax.tree.map(lambda x: update_sharding(x, single), abs_params)
+        else:
+            raise ValueError(
+                "sharding_rules and mesh should both be specified or both None"
+            )
 
         # Initialize non-param states from an actual new instance.
         # The non-returned arrays should be eliminated by jit.
@@ -634,65 +615,37 @@ class MistralModel(nnx.Module):
         non_params = jax.block_until_ready(non_param())
         params = loader(abs_params)
 
-        if sharding_rules:
-            with flax.core.spmd.logical_axis_rules(sharding_rules):
-                pspecs = nnx.get_partition_spec(abs_params)
-            params = jax.lax.with_sharding_constraint(params, pspecs)
         return nnx.merge(graphdef, non_params, params)
+
 
     @classmethod
     def load(
         cls,
-        model_name: str,
-        param_path: Path,
-        dtype="float32",
-        param_dtype="bfloat16",
-        sharding_rules: Sequence[tuple[str, str]] | None = None,
-    ) -> "MistralModel":
-        """Load model from safetensor file saved with `save`.
-
-        Args:
-            model_name: HF model name
-            param_path: path to the previously created safetensor file
-            dtype: computation dtype
-            param_dtype: dtype of the parameters
-            sharding_rules:
-                If set, load the weights with the correct sharding, otherwise,
-                weights are loaded as unsharded single device (jax default).
-        """
-        return cls._load_with(
-            functools.partial(_load_single, param_path),
-            model_name,
-            dtype,
-            param_dtype,
-            sharding_rules,
-        )
-
-    @classmethod
-    def load_multi(
-        cls,
-        model_name: str,
         model_dir: Path,
         dtype="float32",
         param_dtype="bfloat16",
+        mesh: jax.sharding.Mesh | None = None,
         sharding_rules: Sequence[tuple[str, str]] | None = None,
     ) -> "MistralModel":
-        """Load model from safetensor file saved with `save`.
+        """Load converted hf model.
 
         Args:
-            model_name: HF model name
-            param_path: path to the previously created safetensor file
+            model_dir: path to the pre-converted model.
             dtype: computation dtype
             param_dtype: dtype of the parameters
+            mesh: mesh used for sharding, should be set with sharding_rules.
             sharding_rules:
                 If set, load the weights with the correct sharding, otherwise,
                 weights are loaded as unsharded single device (jax default).
         """
+        config = MistralConfig.from_pretrained(model_dir)
+        assert isinstance(config, MistralConfig)
         return cls._load_with(
-            functools.partial(_load_multi, model_dir),
-            model_name,
+            functools.partial(_load_orbax, model_dir / "orbax"),
+            config,
             dtype,
             param_dtype,
+            mesh,
             sharding_rules,
         )
 
@@ -702,8 +655,8 @@ class MistralModel(nnx.Module):
         model_name: str,
         dtype: Dtype = jnp.float32,
         param_dtype: Dtype = jnp.bfloat16,
-        sharding_rules: Sequence[tuple[str, str]] | None = None,
         mesh: jax.sharding.Mesh | None = None,
+        sharding_rules: Sequence[tuple[str, str]] | None = None,
     ) -> "MistralModel":
         """Load model from HF pytorch model.
 
@@ -720,62 +673,23 @@ class MistralModel(nnx.Module):
         Returns:
             MistralModel with loaded weights.
         """
+        config = MistralConfig.from_pretrained(model_name)
+        assert isinstance(config, MistralConfig)
+
         return cls._load_with(
             functools.partial(_load_hf_pt_params, model_name),
-            model_name,
+            config,
             dtype,
             param_dtype,
+            mesh,
             sharding_rules,
         )
 
 
-def _load_single(model_dir: Path, abs_state: nnx.State) -> nnx.State:
-    """Load model from safetensors file.
-
-    Args:
-        path: path to safetensors file.
-        abs_state: abstract state of nnx.Params of the model.
-
-    Returns:
-        nnx.State with actual param arrays that can be `nnx.merge`d into the
-        model.
-    """
-    with safe_open(model_dir / SINGLE_PARAM_FILE, framework="np") as f:
-
-        def load_one(path, abs_param: ShapeDtypeStruct):
-            k = keystr_simple(path[:-1], separator="/")
-            param = jnp.array(f.get_tensor(k), dtype=abs_param.dtype)
-            assert (
-                param.shape == abs_param.shape
-            ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
-            return param
-
-        return jax.tree_util.tree_map_with_path(load_one, abs_state)
-
-
-def _load_multi(model_dir: Path, abs_state: nnx.State) -> nnx.State:
-    """Load model from safetensors file.
-    """
-    index = cached_file(model_dir, PARAM_INDEX_FILE)
-    shard_paths, meta = get_checkpoint_shard_files(model_dir, index)
-    assert isinstance(shard_paths, list)
-
-    with ExitStack() as stack:
-        shards = {
-            os.path.basename(s): stack.enter_context(safe_open(s, "np"))
-            for s in shard_paths
-        }
-        def load_one(path, abs_param):
-            k = keystr_simple(path[:-1], separator="/")
-            param = jnp.array(
-                shards[meta['weight_map'][k]].get_tensor(k),
-                dtype=abs_param.dtype,
-            )
-            assert (
-                param.shape == abs_param.shape
-            ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
-            return param
-        return jax.tree_util.tree_map_with_path(load_one, abs_state)
+def _load_orbax(ckpt_dir: Path, abs_state: nnx.State) -> nnx.State:
+    """Load model from orbax checkpoint."""
+    with ocp.StandardCheckpointer() as checkpointer:
+        return checkpointer.restore(ckpt_dir.absolute(), abs_state)
 
 
 def _load_hf_pt_params(hf_model: str, abs_state: nnx.State) -> nnx.State:
@@ -858,17 +772,26 @@ def _load_hf_pt_params(hf_model: str, abs_state: nnx.State) -> nnx.State:
             assert (
                 param.shape == abs_param.shape
             ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
-            return param.astype(abs_param.dtype)
+            sharding = abs_param.sharding
+            assert isinstance(sharding, jax.sharding.Sharding)
+            return jax.device_put(param.astype(abs_param.dtype), device=sharding)
 
         return jax.tree_util.tree_map_with_path(load_one, abs_state)
 
 
-def convert_and_save_if_not_exist(
-    out_path: Path,
-    model_name: str,
-    param_dtype: Dtype,
-):
-    if out_path.exists():
-        return
-    model = MistralModel.load_from_hf_pt_model(model_name, param_dtype=param_dtype)
-    model.save_multi(out_path)
+
+def convert_hf_model(hf_model: str, output_path: Path, param_dtype=jnp.bfloat16):
+    import shutil
+    from transformers import AutoTokenizer
+
+    model = MistralModel.load_from_hf_pt_model(hf_model, param_dtype=param_dtype)
+
+    output_path.mkdir(exist_ok=True)
+    checkpoint_dir: Path = (output_path / "orbax").absolute()
+    if checkpoint_dir.exists():
+        shutil.rmtree(checkpoint_dir)
+    model.save_orbax(checkpoint_dir)
+
+    # Config and tokenizer
+    model.config.save_pretrained(output_path)
+    AutoTokenizer.from_pretrained(hf_model).save_pretrained(output_path)

@@ -24,6 +24,7 @@ dev = [
     "torch>=2.6.0",
     "pyright>=1.1.400",
     "pytest>=8.3.5",
+    "isort>=6.0.1",
 ]
 
 [build-system]
