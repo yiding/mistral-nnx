@@ -115,9 +115,10 @@ def generate_fixed_pos_embedding(features,
   # from sin(256).
   sinusoid_inp = jnp.einsum(
       'i , j -> i j',
-      jnp.arange(length),
+      jnp.arange(length, dtype=jnp.float32),
       rotational_frequency,
       precision=jax.lax.Precision.HIGHEST)
   sinusoid_inp = jnp.concatenate([sinusoid_inp, sinusoid_inp], axis=-1)
+
   return jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
 

@@ -26,6 +26,8 @@ Not supported:
 from contextlib import ExitStack
 from enum import Enum
 import functools
+import json
+from pathlib import Path
 from flax import nnx
 from flax.typing import Dtype, Initializer
 from jax import Array, ShapeDtypeStruct
@@ -45,6 +47,14 @@ import safetensors.flax
 
 from .embedding import apply_rotary_embedding, generate_fixed_pos_embedding
 from .util import keystr_simple
+
+
+PARAM_INDEX_FILE = "model.safetensors.index.json"
+SINGLE_PARAM_FILE = "model.safetensors"
+
+
+def _multi_param_file(fileno: int) -> Path:
+    return Path(f"model-{fileno}.safetensors")
 
 
 class Axis(str, Enum):
@@ -546,13 +556,44 @@ class MistralModel(nnx.Module):
             dtype=self.dtype,
         )
 
-    def save(self, path: str):
+    def save(self, model_dir: Path):
         """Save model parameters into a safetensor file."""
+        model_dir.mkdir(exist_ok=True)
         state = nnx.state(self, nnx.OfType(nnx.Param))
         tensors = {}
         for k, v in nnx.to_flat_state(state):
             tensors[keystr_simple(k, separator="/")] = v.value
-        safetensors.flax.save_file(tensors, path)
+        safetensors.flax.save_file(tensors, model_dir / SINGLE_PARAM_FILE)
+
+    def save_multi(self, model_dir: Path, max_file_size: int = 1 * 1024 * 1024 * 1024):
+        """Save model parameters into multiple safetensor files.
+        """
+        model_dir.mkdir(exist_ok=True)
+        state = nnx.state(self, nnx.OfType(nnx.Param))
+        index = {}
+        cur_tensors = {}
+        cur_sz = 0
+        file_count = 1
+        for k, v in nnx.to_flat_state(state):
+            key = keystr_simple(k, separator="/")
+            array = v.value
+            assert isinstance(array, Array)
+            cur_tensors[key] = array
+            cur_sz += array.nbytes
+            if cur_sz > max_file_size:
+                file = _multi_param_file(file_count)
+                safetensors.flax.save_file(cur_tensors, model_dir / file)
+                index.update({tk: str(file) for tk in cur_tensors})
+                cur_tensors = {}
+                cur_sz = 0
+                file_count += 1
+
+        file = _multi_param_file(file_count)
+        safetensors.flax.save_file(cur_tensors, model_dir / file)
+        index.update({tk: str(file) for tk in cur_tensors})
+
+        with open(model_dir / PARAM_INDEX_FILE, "w") as f:
+            json.dump({"metadata": {}, "weight_map": index}, f)
 
     @classmethod
     def _load_with(
@@ -603,7 +644,7 @@ class MistralModel(nnx.Module):
     def load(
         cls,
         model_name: str,
-        param_path: str,
+        param_path: Path,
         dtype="float32",
         param_dtype="bfloat16",
         sharding_rules: Sequence[tuple[str, str]] | None = None,
@@ -620,7 +661,35 @@ class MistralModel(nnx.Module):
                 weights are loaded as unsharded single device (jax default).
         """
         return cls._load_with(
-            functools.partial(_load_saved_params, param_path),
+            functools.partial(_load_single, param_path),
+            model_name,
+            dtype,
+            param_dtype,
+            sharding_rules,
+        )
+
+    @classmethod
+    def load_multi(
+        cls,
+        model_name: str,
+        model_dir: Path,
+        dtype="float32",
+        param_dtype="bfloat16",
+        sharding_rules: Sequence[tuple[str, str]] | None = None,
+    ) -> "MistralModel":
+        """Load model from safetensor file saved with `save`.
+
+        Args:
+            model_name: HF model name
+            param_path: path to the previously created safetensor file
+            dtype: computation dtype
+            param_dtype: dtype of the parameters
+            sharding_rules:
+                If set, load the weights with the correct sharding, otherwise,
+                weights are loaded as unsharded single device (jax default).
+        """
+        return cls._load_with(
+            functools.partial(_load_multi, model_dir),
             model_name,
             dtype,
             param_dtype,
@@ -660,18 +729,18 @@ class MistralModel(nnx.Module):
         )
 
 
-def _load_saved_params(path: str, abs_state: nnx.State) -> nnx.State:
+def _load_single(model_dir: Path, abs_state: nnx.State) -> nnx.State:
     """Load model from safetensors file.
 
     Args:
-       path: path to safetensors file.
+        path: path to safetensors file.
         abs_state: abstract state of nnx.Params of the model.
 
     Returns:
         nnx.State with actual param arrays that can be `nnx.merge`d into the
         model.
     """
-    with safe_open(path, framework="np") as f:
+    with safe_open(model_dir / SINGLE_PARAM_FILE, framework="np") as f:
 
         def load_one(path, abs_param: ShapeDtypeStruct):
             k = keystr_simple(path[:-1], separator="/")
@@ -681,6 +750,31 @@ def _load_saved_params(path: str, abs_state: nnx.State) -> nnx.State:
             ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
             return param
 
+        return jax.tree_util.tree_map_with_path(load_one, abs_state)
+
+
+def _load_multi(model_dir: Path, abs_state: nnx.State) -> nnx.State:
+    """Load model from safetensors file.
+    """
+    index = cached_file(model_dir, PARAM_INDEX_FILE)
+    shard_paths, meta = get_checkpoint_shard_files(model_dir, index)
+    assert isinstance(shard_paths, list)
+
+    with ExitStack() as stack:
+        shards = {
+            os.path.basename(s): stack.enter_context(safe_open(s, "np"))
+            for s in shard_paths
+        }
+        def load_one(path, abs_param):
+            k = keystr_simple(path[:-1], separator="/")
+            param = jnp.array(
+                shards[meta['weight_map'][k]].get_tensor(k),
+                dtype=abs_param.dtype,
+            )
+            assert (
+                param.shape == abs_param.shape
+            ), f"Wrong shape for {keystr_simple(path, separator='/')}. Expected: {abs_param.shape}, actual: {param.shape}"
+            return param
         return jax.tree_util.tree_map_with_path(load_one, abs_state)
 
 
@@ -697,8 +791,8 @@ def _load_hf_pt_params(hf_model: str, abs_state: nnx.State) -> nnx.State:
         nnx.State with actual param arrays that can be `nnx.merge`d into the
         model.
     """
-    HF_MODEL_SHARD_INDEX = "model.safetensors.index.json"
-    index = cached_file(hf_model, HF_MODEL_SHARD_INDEX)
+    PARAM_INDEX_FILE = "model.safetensors.index.json"
+    index = cached_file(hf_model, PARAM_INDEX_FILE)
     shard_paths, meta = get_checkpoint_shard_files(hf_model, index)
     assert isinstance(shard_paths, list)
 
@@ -770,11 +864,11 @@ def _load_hf_pt_params(hf_model: str, abs_state: nnx.State) -> nnx.State:
 
 
 def convert_and_save_if_not_exist(
-    weights_path: str,
+    out_path: Path,
     model_name: str,
     param_dtype: Dtype,
 ):
-    if os.path.exists(weights_path):
+    if out_path.exists():
         return
     model = MistralModel.load_from_hf_pt_model(model_name, param_dtype=param_dtype)
-    model.save(weights_path)
+    model.save_multi(out_path)

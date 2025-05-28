@@ -11,13 +11,14 @@ from mistral_nnx.util import timer
 import mistral_nnx.generate
 import transformers
 from transformers import PreTrainedTokenizer
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
 
 MODEL = "mistralai/Mistral-Small-24B-Instruct-2501"
-WEIGHTS = "./Mistral-Small-24B-Instruct-2501.bfloat16.nnx.safetensors"
+NNX_MODEL = Path("./Mistral-Small-24B-Instruct-2501-NNX")
 
 SHARDING_RULES = list(
     {
@@ -57,12 +58,12 @@ def hf_model() -> transformers.AutoModelForCausalLM:
 def nnx_model(mesh: jax.sharding.Mesh) -> nnx.Module:
     with timer("NNX model weight conversion"):
         mistral_nnx.convert_and_save_if_not_exist(
-            WEIGHTS, MODEL, param_dtype=jnp.bfloat16
+            NNX_MODEL, MODEL, param_dtype=jnp.bfloat16
         )
 
     with timer("NNX model loading"):
-        return mistral_nnx.MistralModel.load(
-            MODEL, WEIGHTS, dtype=jnp.float32, sharding_rules=SHARDING_RULES,
+        return mistral_nnx.MistralModel.load_multi(
+            MODEL, NNX_MODEL, dtype=jnp.float32, sharding_rules=SHARDING_RULES,
         )
 
 

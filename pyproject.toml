@@ -16,6 +16,7 @@ dev = [
     "mistral-inference>=1.6.0",
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.5",
+    "kagglehub>=0.3.12",
     "standard-imghdr>=3.13.0",
     "tensorboard-plugin-profile>=2.19.4",
     "tensorboard>=2.19.0",
