@@ -5,6 +5,7 @@ from jax import Array
 import jax.numpy as jnp
 from dataclasses import dataclass
 from .model import MistralModel
+from jax.sharding import Mesh
 
 
 def sample_best(logits: Float[Array, "*B V"]) -> Integer[Array, "*B"]:
@@ -99,12 +100,14 @@ class Generator:
         temperature: float = 1.0,
         top_p: float = 0.8,
         eos_id: int | None = 2,
+        mesh: Mesh | None = None,
     ) -> GenerateResult:
         """Generate output with simple greedy search.
 
         Args:
             input_ids: Sequence of tokens to generate from.
             rngs: rng. The stream named 'sample' is used.
+            mesh: mesh used to shard kv cache, should be the same as what's used for the model.
 
         Returns:
             sequnece of generated tokens
@@ -114,7 +117,7 @@ class Generator:
         assert max_tokens < self.max_seqlen
         result = list(input_ids)
 
-        cache = self.model.create_cache(1, self.max_seqlen)
+        cache = self.model.create_cache(1, self.max_seqlen, mesh)
         all_logits: list[Float[Array, "1 1 V"]] = []
 
         # prefill cache and get first token

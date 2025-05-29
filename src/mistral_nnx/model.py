@@ -25,23 +25,24 @@ Not supported:
 
 from contextlib import ExitStack
 from enum import Enum
-import functools
-from pathlib import Path
 from flax import nnx
 from flax.typing import Dtype, Initializer
 from jax import Array, ShapeDtypeStruct
+from jax.sharding import Mesh, SingleDeviceSharding, NamedSharding, PartitionSpec
 from jaxtyping import Float, Integer
+from pathlib import Path
 from safetensors import safe_open
 from transformers import MistralConfig
-from transformers.generation.configuration_utils import GenerationConfig
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
-from typing import Any, Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
+from flax.typing import LogicalRules
 import flax.core.spmd
 import flax.struct
+import functools
 import jax
 import jax.numpy as jnp
-import os
 import orbax.checkpoint as ocp
+import os
 
 from .embedding import apply_rotary_embedding, generate_fixed_pos_embedding
 from .util import keystr_simple, update_sharding
@@ -74,11 +75,33 @@ class KVCacheLayer:
         return self.cache_k.shape[1]
 
     @classmethod
-    def create(cls, shape: tuple[int, ...], *, dtype: Dtype) -> "KVCacheLayer":
+    def create(
+        cls,
+        shape: tuple[int, ...],
+        dtype: Dtype,
+        mesh: Mesh | None = None,
+        sharding_rules: LogicalRules | None = None,
+    ) -> "KVCacheLayer":
         assert len(shape) == 4, f"shape should be (B,S,H,D), got: {shape}"
+
+        # KV cache takes the output of K and V projections, which is sharded by
+        # KVHEAD, HEAD_DIM.  The KV cache itself should be sharded the same way.
+        if sharding_rules is None and mesh is None:
+            sharding = SingleDeviceSharding(jax.devices("cpu")[0])
+        elif sharding_rules is not None and mesh is not None:
+            rules_dict = {k: v for k, v in sharding_rules}
+            sharding = NamedSharding(
+                mesh,
+                PartitionSpec(
+                    None, None, rules_dict[Axis.KVHEAD], rules_dict[Axis.HEAD]
+                ),
+            )
+        else:
+            raise ValueError("mesh and sharding_rules must be both None or both set")
+
         return cls(
-            cache_k=jnp.zeros(shape, dtype=dtype),
-            cache_v=jnp.zeros(shape, dtype=dtype),
+            cache_k=jnp.zeros(shape, dtype=dtype, device=sharding),
+            cache_v=jnp.zeros(shape, dtype=dtype, device=sharding),
             index=jnp.array(0, dtype="int32"),
         )
 
@@ -128,10 +151,15 @@ class KVCache:
         head_dim: int,
         *,
         dtype: Dtype,
+        mesh: Mesh | None = None,
+        sharding_rules: LogicalRules | None = None,
     ) -> "KVCache":
         shape = (batch_size, max_seqlen, num_kv_heads, head_dim)
         return cls(
-            layers=[KVCacheLayer.create(shape, dtype=dtype) for _ in range(layers)]
+            layers=[
+                KVCacheLayer.create(shape, dtype, mesh, sharding_rules)
+                for _ in range(layers)
+            ]
         )
 
 
@@ -317,7 +345,7 @@ class Attention(nnx.Module):
     def _queries_per_head(self) -> int:
         return self.n_q_heads // self.n_kv_heads
 
-    def __call__(self, x: Array) -> Array:
+    def __call__(self, x: Float[Array, "B S E"]) -> Array:
         """
         Args:
           x: Array of shape (batch, seqlen, dim)
@@ -439,6 +467,7 @@ class TransformerBlock(nnx.Module):
 class MistralModel(nnx.Module):
     layers: list[TransformerBlock]
     config: MistralConfig
+    sharding_rules: LogicalRules | None
 
     def __init__(
         self,
@@ -447,13 +476,15 @@ class MistralModel(nnx.Module):
         dtype: Dtype,
         param_dtype: Dtype,
         rngs: nnx.Rngs,
+        sharding_rules: LogicalRules | None = None,
     ):
+        self.config = config
+        self.dtype = dtype
+        self.sharding_rules = sharding_rules  # keep track of sharding rules for creating compatible kv cache
+
         embed_init = _init_with_sharding(nnx.initializers.lecun_normal())
         norm_init = _init_with_sharding(nnx.initializers.zeros_init())
         linear_init = _init_with_sharding(nnx.initializers.lecun_normal())
-
-        self.config = config
-        self.dtype = dtype
 
         head_dim = config.head_dim
         assert type(head_dim) is int
@@ -538,7 +569,9 @@ class MistralModel(nnx.Module):
         logits = self.output(h)
         return logits, cache
 
-    def create_cache(self, batch_size: int, max_seqlen: int) -> KVCache:
+    def create_cache(
+        self, batch_size: int, max_seqlen: int, mesh: Mesh | None = None
+    ) -> KVCache:
         head_dim = self.config.head_dim
         assert type(head_dim) is int
         return KVCache.create(
@@ -548,6 +581,8 @@ class MistralModel(nnx.Module):
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=head_dim,
             dtype=self.dtype,
+            mesh=mesh,
+            sharding_rules=self.sharding_rules,
         )
 
     def save_orbax(self, ckpt_dir: Path, max_file_size: int = 1 * 1024 * 1024 * 1024):
@@ -565,7 +600,7 @@ class MistralModel(nnx.Module):
         dtype: Dtype,
         param_dtype: Dtype,
         mesh: jax.sharding.Mesh | None = None,
-        sharding_rules: Sequence[tuple[str, str]] | None = None,
+        sharding_rules: LogicalRules | None = None,
     ):
         """Create a model instance using the specific weight loading function.
 
@@ -581,6 +616,7 @@ class MistralModel(nnx.Module):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 rngs=nnx.Rngs(0),
+                sharding_rules=sharding_rules,
             )
         )
         graphdef = nnx.graphdef(abs_model)
@@ -609,14 +645,19 @@ class MistralModel(nnx.Module):
         # This gets things like precomputed rope-embedding constants.
         @jax.jit
         def non_param():
-            model = cls(config, dtype=dtype, param_dtype=param_dtype, rngs=nnx.Rngs(0))
+            model = cls(
+                config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=nnx.Rngs(0),
+                sharding_rules=sharding_rules,
+            )
             return nnx.state(model, nnx.Not(nnx.OfType(nnx.Param)))
 
         non_params = jax.block_until_ready(non_param())
         params = loader(abs_params)
 
         return nnx.merge(graphdef, non_params, params)
-
 
     @classmethod
     def load(
@@ -777,7 +818,6 @@ def _load_hf_pt_params(hf_model: str, abs_state: nnx.State) -> nnx.State:
             return jax.device_put(param.astype(abs_param.dtype), device=sharding)
 
         return jax.tree_util.tree_map_with_path(load_one, abs_state)
-
 
 
 def convert_hf_model(hf_model: str, output_path: Path, param_dtype=jnp.bfloat16):

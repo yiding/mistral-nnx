@@ -121,7 +121,7 @@ def test_generate(tokenizer, mesh, nnx_model):
     rngs = nnx.Rngs(0)
 
     with timer("test_generate - Decoding w/ kv cache"):
-        result = generator.generate(tokens, rngs=rngs, max_tokens=10)
+        result = generator.generate(tokens, rngs=rngs, max_tokens=10, mesh=mesh)
 
     # run tokens through forward pass
     all_tokens = jnp.array(result.tokens)[None, ...]
