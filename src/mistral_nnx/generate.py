@@ -1,11 +1,13 @@
-from flax import nnx
-import jax
-from jaxtyping import Float, Integer
-from jax import Array
-import jax.numpy as jnp
 from dataclasses import dataclass
-from .model import MistralModel
+
+import jax
+import jax.numpy as jnp
+from flax import nnx
+from jax import Array
 from jax.sharding import Mesh
+from jaxtyping import Float, Integer
+
+from .model import MistralModel
 
 
 def sample_best(logits: Float[Array, "*B V"]) -> Integer[Array, "*B"]:

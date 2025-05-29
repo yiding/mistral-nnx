@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-import mistral_nnx
-from mistral_nnx import generate
-
 import collections
+import unittest
+
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-import flax.nnx as nnx
-import unittest
+
+import mistral_nnx
+from mistral_nnx import generate
 
 # on cuda using float16/float32 results in weird precision errors causing test
 # failures. bfloat16 seems to work fine everywhere.

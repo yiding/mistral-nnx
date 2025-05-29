@@ -20,6 +20,7 @@ From flaxformers/components/embedding.py
 """
 
 import functools
+
 import jax
 import jax.numpy as jnp
 

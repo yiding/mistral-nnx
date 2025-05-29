@@ -23,30 +23,30 @@ Not supported:
 
 """
 
+import functools
+import os
 from contextlib import ExitStack
 from enum import Enum
-from flax import nnx
-from flax.typing import Dtype, Initializer
-from jax import Array, ShapeDtypeStruct
-from jax.sharding import Mesh, SingleDeviceSharding, NamedSharding, PartitionSpec
-from jaxtyping import Float, Integer
 from pathlib import Path
-from safetensors import safe_open
-from transformers import MistralConfig
-from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 from typing import Any, Callable, Optional, Sequence
-from flax.typing import LogicalRules
+
 import flax.core.spmd
 import flax.struct
-import functools
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
-import os
+from flax import nnx
+from flax.typing import Dtype, Initializer, LogicalRules
+from jax import Array, ShapeDtypeStruct
+from jax.sharding import (Mesh, NamedSharding, PartitionSpec,
+                          SingleDeviceSharding)
+from jaxtyping import Float, Integer
+from safetensors import safe_open
+from transformers import MistralConfig
+from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 from .embedding import apply_rotary_embedding, generate_fixed_pos_embedding
 from .util import keystr_simple, update_sharding
-
 
 PARAM_INDEX_FILE = "model.safetensors.index.json"
 SINGLE_PARAM_FILE = "model.safetensors"
@@ -822,6 +822,7 @@ def _load_hf_pt_params(hf_model: str, abs_state: nnx.State) -> nnx.State:
 
 def convert_hf_model(hf_model: str, output_path: Path, param_dtype=jnp.bfloat16):
     import shutil
+
     from transformers import AutoTokenizer
 
     model = MistralModel.load_from_hf_pt_model(hf_model, param_dtype=param_dtype)

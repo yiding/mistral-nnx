@@ -1,8 +1,10 @@
 import time
 from contextlib import contextmanager
 from typing import Generator
+
 from jax import ShapeDtypeStruct
-from jax.tree_util import KeyPath, SequenceKey, DictKey, GetAttrKey, FlattenedIndexKey
+from jax.tree_util import (DictKey, FlattenedIndexKey, GetAttrKey, KeyPath,
+                           SequenceKey)
 
 
 @contextmanager

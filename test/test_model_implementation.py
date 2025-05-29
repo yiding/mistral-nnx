@@ -5,17 +5,18 @@ Can be run with multiple devices, e.g. via
     XLA_FLAGS=--xla_force_host_platform_device_count=4
 """
 
-import pytest
-import mistral_nnx
-from mistral_nnx.util import timer
-import mistral_nnx.generate
-import transformers
-from transformers import PreTrainedTokenizer
 from pathlib import Path
 
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-import flax.nnx as nnx
+import pytest
+import transformers
+from transformers import PreTrainedTokenizer
+
+import mistral_nnx
+import mistral_nnx.generate
+from mistral_nnx.util import timer
 
 MODEL = "mistralai/Mistral-Small-24B-Instruct-2501"
 NNX_MODEL = Path("./Mistral-Small-24B-Instruct-2501-NNX")
