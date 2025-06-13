@@ -19,7 +19,7 @@ import mistral_nnx.generate
 from mistral_nnx.util import timer
 
 MODEL = "mistralai/Mistral-Small-24B-Instruct-2501"
-NNX_MODEL = Path("./Mistral-Small-24B-Instruct-2501-NNX")
+NNX_MODEL = Path("./models/Mistral-Small-24B-Instruct-2501-NNX")
 
 SHARDING_RULES = list(
     {
@@ -57,7 +57,10 @@ def nnx_model(mesh: jax.sharding.Mesh) -> nnx.Module:
 
     with timer("NNX model loading"):
         return mistral_nnx.MistralModel.load(
-            NNX_MODEL, dtype=jnp.float32, mesh=mesh, sharding_rules=SHARDING_RULES,
+            NNX_MODEL,
+            dtype=jnp.float32,
+            mesh=mesh,
+            sharding_rules=SHARDING_RULES,
         )
 
 
@@ -66,6 +69,7 @@ def load_hf_model() -> transformers.MistralForCausalLM:
         return transformers.AutoModelForCausalLM.from_pretrained(MODEL)
 
 
+@pytest.mark.slow
 def test_compare_hf(tokenizer, mesh, nnx_model):
     """Compare model implementation output vs huggingface torch model.
 
@@ -98,6 +102,7 @@ def test_compare_hf(tokenizer, mesh, nnx_model):
             logits = load_hf_model().forward(**tokens).logits
             assert logits is not None
             return jnp.array(logits.detach())
+
     hf_result = get_hf_result()
 
     # Check that the results are close enough.
@@ -114,6 +119,7 @@ def test_compare_hf(tokenizer, mesh, nnx_model):
     assert hf_argmax.tolist() == nnx_argmax.tolist(), "expected argmax to match."
 
 
+@pytest.mark.slow
 def test_generate(tokenizer, mesh, nnx_model):
     """Compare output using the kv-cache decoding `Generator` to the simple forward pass."""
     input = "[INST]31 * 12 = [/INST] "

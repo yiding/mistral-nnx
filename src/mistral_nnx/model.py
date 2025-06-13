@@ -28,7 +28,7 @@ import os
 from contextlib import ExitStack
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Sequence
 
 import flax.core.spmd
 import flax.struct
@@ -38,18 +38,16 @@ import orbax.checkpoint as ocp
 from flax import nnx
 from flax.typing import Dtype, Initializer, LogicalRules
 from jax import Array, ShapeDtypeStruct
-from jax.sharding import (Mesh, NamedSharding, PartitionSpec,
-                          SingleDeviceSharding)
+from jax.sharding import Mesh, NamedSharding, PartitionSpec, SingleDeviceSharding
 from jaxtyping import Float, Integer
 from safetensors import safe_open
 from transformers import MistralConfig
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
-from .embedding import apply_rotary_embedding, generate_fixed_pos_embedding
+from .embedding import RotaryEmbedding
 from .util import keystr_simple, update_sharding
 
 PARAM_INDEX_FILE = "model.safetensors.index.json"
-SINGLE_PARAM_FILE = "model.safetensors"
 
 
 class Axis(str, Enum):
@@ -161,56 +159,6 @@ class KVCache:
                 for _ in range(layers)
             ]
         )
-
-
-class RotaryEmbedding(nnx.Module):
-    def __init__(self, features: int, length: int, theta: float):
-        """
-        Args:
-            features: Number of features
-            length: Max context length
-            theta: RoPE theta term
-        """
-        sin, cos = generate_fixed_pos_embedding(features, length, max_timescale=theta)
-        self.sin = nnx.Variable(sin)
-        self.cos = nnx.Variable(cos)
-
-    def __call__(
-        self,
-        q: Float[Array, "B S HQ D"],
-        k: Float[Array, "B S K D"],
-        index: Optional[Integer[Array, "B"]] = None,
-    ) -> tuple[Float[Array, "B S HQ D"], Float[Array, "B S K D"]]:
-        """Apply rotary embedding to query and key arrays.
-
-        Args:
-            q: query of shape (batch, seqlen, heads, head_dim)
-            k: key of shape (batch, seqlen, heads, head_dim)
-            index: position offset of query shape (batch,).
-                Used for incremental decoding w/ kv cache. seqlen==1 required
-                for q if this is set.
-
-        Returns:
-            (q, k) with embedding applied.
-
-        Note: This expects features to be ordered in odds and evens, i.e.
-        `x1, x3, x5 ... x2, x4, x6 ...`.
-
-        The weights for the whole model should be in this order. If using
-        weights that expect features to be (i.e. the mistral weights as used by
-        mistral-inference lib), it has to be converted into this order.
-        """
-        # Limitation of flaxformers apply_rotary_embedding
-        assert index is None or q.shape[1] == 1, "seqlen==1 required when index is set"
-        out_q, out_k = apply_rotary_embedding(
-            q,
-            k,
-            self.cos.value,
-            self.sin.value,
-            decode=index is not None,
-            rotary_index=index,
-        )
-        return out_q.astype(q.dtype), out_k.astype(k.dtype)
 
 
 def _init_with_sharding(
@@ -663,8 +611,8 @@ class MistralModel(nnx.Module):
     def load(
         cls,
         model_dir: Path,
-        dtype="float32",
-        param_dtype="bfloat16",
+        dtype: Dtype = jnp.float32,
+        param_dtype: Dtype = jnp.bfloat16,
         mesh: jax.sharding.Mesh | None = None,
         sharding_rules: Sequence[tuple[str, str]] | None = None,
     ) -> "MistralModel":
