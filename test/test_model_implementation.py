@@ -12,14 +12,19 @@ import jax
 import jax.numpy as jnp
 import pytest
 import transformers
+from jaxtyping import Array
 from transformers import PreTrainedTokenizer
 
 import mistral_nnx
 import mistral_nnx.generate
 from mistral_nnx.util import timer
 
-MODEL = "mistralai/Mistral-Small-24B-Instruct-2501"
-NNX_MODEL = Path("./models/Mistral-Small-24B-Instruct-2501-NNX")
+if False:
+    MODEL = "mistralai/Mistral-Small-24B-Instruct-2501"
+    NNX_MODEL = Path("./models/Mistral-Small-24B-Instruct-2501-NNX")
+else:
+    MODEL = "mistralai/Ministral-8B-Instruct-2410"
+    NNX_MODEL = Path("./models/Ministral-8B-Instruct-2410-NNX")
 
 SHARDING_RULES = list(
     {
@@ -128,10 +133,12 @@ def test_generate(tokenizer, mesh, nnx_model):
     rngs = nnx.Rngs(0)
 
     with timer("test_generate - Decoding w/ kv cache"):
-        result = generator.generate(tokens, rngs=rngs, max_tokens=10, mesh=mesh)
+        result = generator.generate(tokens, rngs=rngs, max_tokens=20, mesh=mesh)
+    S, V = result.logits.shape
 
-    # run tokens through forward pass
-    all_tokens = jnp.array(result.tokens)[None, ...]
+    # run tokens through forward pass, ignore the last token since we don't
+    # generate logits based on the final token.
+    all_tokens = jnp.array(result.tokens[0:S])[None, ...]
 
     @jax.jit
     def jit_model(graphdef, state, input):
@@ -147,6 +154,8 @@ def test_generate(tokenizer, mesh, nnx_model):
         all_logits = compiled_model(graphdef, state, all_tokens)
         all_logits.block_until_ready()
 
+    print(all_logits)
+    print(result.logits)
     assert jnp.allclose(
         all_logits, result.logits[None, ...], atol=1e-4
     ), "expected kv-cache generated logits to match forward pass."

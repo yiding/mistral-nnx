@@ -39,7 +39,7 @@ from flax import nnx
 from flax.typing import Dtype, Initializer, LogicalRules
 from jax import Array, ShapeDtypeStruct
 from jax.sharding import Mesh, NamedSharding, PartitionSpec, SingleDeviceSharding
-from jaxtyping import Float, Integer
+from jaxtyping import Bool, Float, Integer
 from safetensors import safe_open
 from transformers import MistralConfig
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
@@ -48,6 +48,32 @@ from .embedding import RotaryEmbedding
 from .util import keystr_simple, update_sharding
 
 PARAM_INDEX_FILE = "model.safetensors.index.json"
+
+
+class Causal:
+    pass
+
+
+def tril_mask(
+    rows: int,
+    cols: int,
+    start_index: int,
+    dtype=jnp.bool,
+):
+    """
+    Create a triangular mask matrix.
+
+    ```
+            v start_index
+            0 1 2 3   <- cols
+        +--------
+        0 | 1 1 0 0
+        1 | 1 1 1 0
+        2 | 1 1 1 1
+        ^ rows
+    ```
+    """
+    return jnp.tri(rows, cols, k=start_index, dtype=dtype)
 
 
 class Axis(str, Enum):
@@ -313,18 +339,28 @@ class Attention(nnx.Module):
         self,
         x: Float[Array, "B S E"],
         cache: KVCacheLayer,
+        mask: Bool[Array, "B S S"] | type[Causal] | None = None,
     ) -> tuple[Float[Array, "B S E"], KVCacheLayer]:
         """Decode using KV cache.
 
         Args:
-            x: The next items in the sequence. Shape (batch, seqlen, dim)
+            x: The next items in the sequence.
+            mask: Causal mask to use, see explanation below.
 
         Returns:
             (output, cache_layer) the output and updated cache layer.
+
+
+        Regarding `mask`:
+        - If array, use a custom causal mask.
+        - If `Causal`, use attention implementation's causal mask, which could
+          be faster. This is correct only at the start of sequence.
+        - If None, use no causal mask. This can be used when predicting a single
+            next token.
+
         """
         B, T, _E = x.shape
         assert B == 1, "only batch size 1 supported for now"
-        assert T == 1, "decode takes one token at a time"
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         start_index = jnp.full((B,), cache.index)
@@ -336,10 +372,24 @@ class Attention(nnx.Module):
         xk = cache.cache_k
         xv = cache.cache_v
 
+        if mask is Causal:
+            actual_mask = None
+            is_causal = True
+        elif mask is None:
+            actual_mask = None
+            is_causal = False
+        elif isinstance(mask, jax.Array):
+            actual_mask = mask
+            is_causal = False
+        else:
+            raise ValueError(f"Invalid mask type: {type(mask)}")
+
         out = jax.nn.dot_product_attention(
             xq,
             xk,
             xv,
+            mask=actual_mask,
+            is_causal=is_causal,
             query_seq_lengths=jnp.array([T], dtype=jnp.int32),
             key_value_seq_lengths=jnp.full((B,), cache.index, dtype=jnp.int32),
         )
@@ -411,8 +461,9 @@ class TransformerBlock(nnx.Module):
         self,
         x: Float[Array, "B S E"],
         cache: KVCacheLayer,
+        mask: Bool[Array, "B S S"] | type[Causal] | None = None,
     ) -> tuple[Float[Array, "B S E"], KVCacheLayer]:
-        r, cache = self.attention.decode(self.attention_norm(x), cache)
+        r, cache = self.attention.decode(self.attention_norm(x), cache, mask)
         h = x + r
         r = self.mlp(self.ffn_norm(h))
         return h + r, cache
@@ -507,6 +558,7 @@ class MistralModel(nnx.Module):
         self,
         input_ids: Integer[Array, "B S"],
         cache: KVCache,
+        mask: Bool[Array, "B S S"] | type[Causal] | None = None,
     ) -> tuple[Float[Array, "B S V"], KVCache]:
         """Inference mode using kvcache.
 
@@ -518,7 +570,7 @@ class MistralModel(nnx.Module):
         """
         h = self.embed(input_ids)
         for i, layer in enumerate(self.layers):
-            h, cache.layers[i] = layer.decode(h, cache.layers[i])
+            h, cache.layers[i] = layer.decode(h, cache.layers[i], mask)
         h = self.norm(h)
         logits = self.output(h)
         return logits, cache

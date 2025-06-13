@@ -29,7 +29,13 @@ def test_generate():
     )
     generator = generate.Generator(model, max_seqlen=256)
     r = generator.generate([1, 2, 3, 4, 5], rngs=nnx.Rngs(0), max_tokens=15)
-    assert len(r.logits) > 5
+    assert len(r.logits) > 6
+
+    expected = model(jnp.array(r.tokens[0:-1])[None, ...])
+
+    assert jnp.allclose(
+        expected, r.logits[None, ...], atol=1e-4
+    ), "expected kv-cache generated logits to match forward pass."
 
 
 def test__sample_top_p():

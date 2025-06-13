@@ -7,7 +7,7 @@ from jax import Array
 from jax.sharding import Mesh
 from jaxtyping import Float, Integer
 
-from .model import MistralModel
+from .model import Causal, MistralModel
 
 
 def sample_best(logits: Float[Array, "*B V"]) -> Integer[Array, "*B"]:
@@ -79,6 +79,10 @@ class Generator:
         # Use jax.jit with pre-split model to avoid nnx.jit's cpu and memory
         # overhead.
         self.graphdef, self.state = nnx.split(self.model)
+        self._jit_prefill = jax.jit(
+            self._jit_prefill_impl,
+            donate_argnames=("cache",),
+        )
         self._jit_decode = jax.jit(
             self._jit_decode_impl,
             donate_argnames=("cache",),
@@ -88,9 +92,16 @@ class Generator:
         self._jit_sample_top_p = nnx.jit(sample_top_p)
 
     @staticmethod
+    def _jit_prefill_impl(graphdef, state, input, cache):
+        model = nnx.merge(graphdef, state)
+        logits, cache = model.decode(input, cache, mask=Causal)
+        return logits, cache
+
+    @staticmethod
     def _jit_decode_impl(graphdef, state, input, cache):
         model = nnx.merge(graphdef, state)
-        logits, cache = model.decode(input, cache)
+        assert input.shape[1] == 1
+        logits, cache = model.decode(input, cache, mask=None)
         return logits, cache
 
     def generate(
@@ -126,17 +137,11 @@ class Generator:
         input = jnp.array(input_ids, dtype="int32")
         input = input.reshape(1, -1)
         logits = None
-        for i in range(input.shape[1]):
-            logits, cache = self._jit_decode(
-                self.graphdef,
-                self.state,
-                input[1, i].reshape(1, 1),
-                cache,
-            )
-            all_logits.append(logits)
-        assert logits is not None
+        logits, cache = self._jit_prefill(self.graphdef, self.state, input, cache)
+        all_logits.append(logits)
+        logits = logits[:, None, -1, ...]
 
-        for _ in range(max_tokens):
+        while len(result) < max_tokens:
             last_chosen = self._jit_sample_top_p(
                 logits[0, -1, :],
                 temperature=temperature,
@@ -145,7 +150,12 @@ class Generator:
             )
             assert len(last_chosen.shape) == 0
             result.append(last_chosen.item())
+
             if eos_id != None and last_chosen.item() == eos_id:
+                break
+            if len(result) >= max_tokens:
+                # If we are at the max tokens, avoid uselessly running the
+                # model.
                 break
 
             logits, cache = self._jit_decode(
@@ -158,5 +168,5 @@ class Generator:
 
         return GenerateResult(
             tokens=result,
-            logits=jnp.stack([x.reshape(-1) for x in all_logits]),
+            logits=jnp.concatenate(all_logits, axis=1)[0, ...],
         )
