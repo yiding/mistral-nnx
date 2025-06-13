@@ -16,7 +16,7 @@
 
 This implementation expects the features to be ordered in odds and evens.
 
-From flaxformers/components/embedding.py
+Based on flaxformers/components/embedding.py
 """
 
 import functools
@@ -41,40 +41,32 @@ class RotaryEmbedding(nnx.Module):
 
     def __call__(
         self,
-        q: Float[Array, "B S HQ D"],
-        k: Float[Array, "B S K D"],
-        index: Integer[Array, "B"] | None = None,
-    ) -> tuple[Float[Array, "B S HQ D"], Float[Array, "B S K D"]]:
-        """Apply rotary embedding to query and key arrays.
+        arr: Float[Array, "B S H D"],
+        start_index: Integer[Array, "B"] | None = None,
+    ) -> Float[Array, "B S H D"]:
+        """Apply rotary embedding to a query or key array.
 
         Args:
-            q: query of shape (batch, seqlen, heads, head_dim)
-            k: key of shape (batch, seqlen, heads, head_dim)
-            index: position offset of query shape (batch,).
-                Used for incremental decoding w/ kv cache. seqlen==1 required
-                for q if this is set.
+            arr: query of shape (batch, seqlen, heads, head_dim)
+            start_index: start index in the sequence for each batch.
 
         Returns:
-            (q, k) with embedding applied.
+            array with embedding applied.
 
         Note: This expects features to be ordered in odds and evens, i.e.
-        `x1, x3, x5 ... x2, x4, x6 ...`.
+          `x1, x3, x5 ... x2, x4, x6 ...`.
 
-        The weights for the whole model should be in this order. If using
-        weights that expect features to be (i.e. the mistral weights as used by
-        mistral-inference lib), it has to be converted into this order.
+          The weights for the whole model should be in this order. If using
+          weights that expect features to be (i.e. the mistral weights as used by
+          mistral-inference lib), it has to be converted into this order.
         """
-        # Limitation of flaxformers apply_rotary_embedding
-        assert index is None or q.shape[1] == 1, "seqlen==1 required when index is set"
-        out_q, out_k = apply_rotary_embedding(
-            q,
-            k,
-            self.cos.value,
-            self.sin.value,
-            decode=index is not None,
-            rotary_index=index,
-        )
-        return out_q.astype(q.dtype), out_k.astype(k.dtype)
+        if start_index is None:
+            start_index = jnp.zeros((arr.shape[0],), dtype=jnp.uint32)
+        return jax.vmap(
+            _apply_rotary_embedding,
+            in_axes=(0, 0, None, None),
+            out_axes=0,
+        )(arr, start_index, self.cos.value, self.sin.value)
 
 
 def rotate_half(x):
@@ -84,51 +76,25 @@ def rotate_half(x):
     return x
 
 
-@functools.partial(jax.jit, static_argnums=(4,))
-def apply_rotary_embedding(q, k, cos, sin, decode=False, rotary_index=None):
-    """Helper function to apply Rotary Embeddings."""
-    if len(k.shape) == 3:
-        # for multi query attention
-        k = jnp.expand_dims(k, 2)
-        multiquery = True
-    else:
-        multiquery = False
+def _apply_rotary_embedding(
+    arr: Float[Array, "S H D"],
+    start_index: Integer[Array, ""],
+    cos: Float[Array, "L D"],
+    sin: Float[Array, "L D"],
+):
+    S, H, D = arr.shape
+    zero = jnp.array(0, dtype=start_index.dtype)
 
-    batch, qlen, qheads, d = q.shape
-    kbatch, klen, kheads, kd = k.shape
-    assert batch == kbatch, f"{batch} != {kbatch}"
-    assert d == kd, f"{d} != {kd}"
+    # Get the portion of the embedding vector starting at the index.
+    cos_slice = jax.lax.dynamic_slice(cos, (start_index, zero), (S, D))
+    sin_slice = jax.lax.dynamic_slice(sin, (start_index, zero), (S, D))
 
-    # cos: [len, d]
-    # sin: [len, d]
-    # rotary_index: [batch]
+    # Replicate for each head.
+    cos_slice = jax.lax.broadcast_in_dim(cos_slice, (S, H, D), (0, 2))
+    sin_slice = jax.lax.broadcast_in_dim(sin_slice, (S, H, D), (0, 2))
 
-    if decode and qlen == 1 and rotary_index is not None:
-        # we check qlen == 1 so that we don't do this when initializing cache.
-        qcos = cos[rotary_index, :]
-        qsin = sin[rotary_index, :]
-        # qcos, qsin: [batch, d]
-        qcos = jax.lax.broadcast_in_dim(qcos, (batch, qlen, qheads, d), (0, 3))
-        qsin = jax.lax.broadcast_in_dim(qsin, (batch, qlen, qheads, d), (0, 3))
-        # qcos, qsin: [batch, qlen, qheads, d]
-    else:
-        qcos, qsin = cos[:qlen, :], sin[:qlen, :]
-        # qcos, qsin: [qlen, d]
-        qcos = jax.lax.broadcast_in_dim(qcos, (batch, qlen, qheads, d), (1, 3))
-        qsin = jax.lax.broadcast_in_dim(qsin, (batch, qlen, qheads, d), (1, 3))
-        # qcos, qsin: [batch, qlen, qheads, d]
-
-    kcos, ksin = cos[:klen, :], sin[:klen, :]
-    # kcos, ksin: [klen, d]
-    kcos = jax.lax.broadcast_in_dim(kcos, (batch, klen, kheads, d), (1, 3))
-    ksin = jax.lax.broadcast_in_dim(ksin, (batch, klen, kheads, d), (1, 3))
-    # kcos, ksin: [batch, klen, kheads, d]
-
-    out_q = (q * qcos) + (rotate_half(q) * qsin)
-    out_k = (k * kcos) + (rotate_half(k) * ksin)
-    if multiquery:
-        out_k = jnp.squeeze(out_k, 2)
-    return out_q, out_k
+    rotated = arr * cos_slice + rotate_half(arr) * sin_slice
+    return rotated.astype(arr.dtype)
 
 
 def generate_fixed_pos_embedding(

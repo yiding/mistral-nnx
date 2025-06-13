@@ -100,11 +100,14 @@ class KVCacheLayer:
         return cls(
             cache_k=jnp.zeros(shape, dtype=dtype, device=sharding),
             cache_v=jnp.zeros(shape, dtype=dtype, device=sharding),
-            index=jnp.array(0, dtype="int32"),
+            index=jnp.array(0, dtype="uint32"),
         )
 
     def update(
-        self, k: Float[Array, "B S H D"], v: Float[Array, "B S H D"]
+        self,
+        k: Float[Array, "B S H D"],
+        v: Float[Array, "B S H D"],
+        len: Float[Array, ""],
     ) -> "KVCacheLayer":
         """Update the cache at the given index.
 
@@ -113,6 +116,7 @@ class KVCacheLayer:
         Args:
             k: key array of shape (seqlen, num_kv_heads, head_dim)
             v: value array of same shape
+            len: actual length
 
         Returns:
             updated cache layer with seqlen incremented by the amount from input.
@@ -131,7 +135,7 @@ class KVCacheLayer:
             cache_v=jax.lax.dynamic_update_slice(
                 self.cache_v, v, (Z, self.index, Z, Z)
             ),
-            index=self.index + KS,
+            index=self.index + len,
         )
 
 
@@ -299,7 +303,7 @@ class Attention(nnx.Module):
           x: Array of shape (batch, seqlen, dim)
         """
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq, xk = self.rope(xq, xk)
+        xq, xk = self.rope(xq), self.rope(xk)
 
         out = jax.nn.dot_product_attention(xq, xk, xv, is_causal=True)
         out = self.wo(out)
@@ -323,19 +327,21 @@ class Attention(nnx.Module):
         assert T == 1, "decode takes one token at a time"
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        cache = cache.update(xk, xv)
+        start_index = jnp.full((B,), cache.index)
+
+        xq = self.rope(xq, start_index=start_index)
+        xk = self.rope(xk, start_index=start_index)
+
+        cache = cache.update(xk, xv, jnp.array(T, dtype=jnp.uint32))
         xk = cache.cache_k
         xv = cache.cache_v
-
-        index = jnp.array([cache.index - T], dtype="int32")
-        xq, xk = self.rope(xq, xk, index=index)
 
         out = jax.nn.dot_product_attention(
             xq,
             xk,
             xv,
-            query_seq_lengths=jnp.array([T], dtype="int32"),
-            key_value_seq_lengths=cache.index.reshape(B),
+            query_seq_lengths=jnp.array([T], dtype=jnp.int32),
+            key_value_seq_lengths=jnp.full((B,), cache.index, dtype=jnp.int32),
         )
         out = self.wo(out)
         return out, cache
